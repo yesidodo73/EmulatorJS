@@ -5444,19 +5444,13 @@ class EmulatorJS {
         }
         addToMenu(this.localization("Screen Recording FPS"), "screenRecordFPS", screenRecordFPSs, screenRecordFPS, screenCaptureOptions, true);
 
-        let screenRecordFormats = {
-            "mp4": "mp4",
-            "webm": "webm"
-        }
-        for (const format in screenRecordFormats) {
-            if (!MediaRecorder.isTypeSupported("video/" + format)) {
-                delete screenRecordFormats[format];
+        const screenRecordFormats = this.getSupportedScreenRecordingFormats();
+        if (Object.keys(screenRecordFormats).length > 0) {
+            if (!(this.capture.video.format in screenRecordFormats)) {
+                this.capture.video.format = Object.keys(screenRecordFormats)[0];
             }
+            addToMenu(this.localization("Screen Recording Format"), "screenRecordFormat", screenRecordFormats, this.capture.video.format, screenCaptureOptions, true);
         }
-        if (!(this.capture.video.format in screenRecordFormats)) {
-            this.capture.video.format = Object.keys(screenRecordFormats)[0];
-        }
-        addToMenu(this.localization("Screen Recording Format"), "screenRecordFormat", screenRecordFormats, this.capture.video.format, screenCaptureOptions, true);
 
         const screenRecordUpscale = this.capture.video.upscale.toString();
         let screenRecordUpscales = {
@@ -6264,6 +6258,68 @@ class EmulatorJS {
         });
     }
 
+    getScreenRecordingTypeCandidates(format, hasAudio) {
+        const candidates = [];
+        const audio = hasAudio !== false;
+        if (format === "mp4" || format === "detect") {
+            const mp4Types = audio ? [
+                'video/mp4;codecs="avc1.42E01E,mp4a.40.2"',
+                'video/mp4;codecs="avc1.4D401E,mp4a.40.2"',
+                'video/mp4;codecs="avc1.64001F,mp4a.40.2"',
+                'video/mp4;codecs="h264,aac"'
+            ] : [
+                'video/mp4;codecs="avc1.42E01E"',
+                'video/mp4;codecs="avc1.4D401E"',
+                'video/mp4;codecs="avc1.64001F"',
+                'video/mp4;codecs="h264"'
+            ];
+            if (this.isSafari) {
+                mp4Types.push("video/mp4");
+            }
+            for (const mimeType of mp4Types) {
+                candidates.push({ format: "mp4", extension: "mp4", mimeType });
+            }
+        }
+        if (format === "webm" || format === "detect") {
+            const webmTypes = audio ? [
+                'video/webm;codecs="vp9,opus"',
+                'video/webm;codecs="vp8,opus"',
+                "video/webm"
+            ] : [
+                'video/webm;codecs="vp9"',
+                'video/webm;codecs="vp8"',
+                "video/webm"
+            ];
+            for (const mimeType of webmTypes) {
+                candidates.push({ format: "webm", extension: "webm", mimeType });
+            }
+        }
+        return candidates;
+    }
+
+    getPreferredScreenRecordingType(format, hasAudio) {
+        if (typeof MediaRecorder !== "function" || typeof MediaRecorder.isTypeSupported !== "function") {
+            return null;
+        }
+        const candidates = this.getScreenRecordingTypeCandidates(format, hasAudio);
+        for (const candidate of candidates) {
+            if (MediaRecorder.isTypeSupported(candidate.mimeType)) {
+                return candidate;
+            }
+        }
+        return null;
+    }
+
+    getSupportedScreenRecordingFormats() {
+        const formats = {};
+        for (const format of ["mp4", "webm"]) {
+            if (this.getPreferredScreenRecordingType(format, true) || this.getPreferredScreenRecordingType(format, false)) {
+                formats[format] = format;
+            }
+        }
+        return formats;
+    }
+
     collectScreenRecordingMediaTracks(canvasEl, fps) {
         let videoTrack = null;
         const videoTracks = canvasEl.captureStream(fps).getVideoTracks();
@@ -6366,21 +6422,52 @@ class EmulatorJS {
 
         const chunks = [];
         const tracks = this.collectScreenRecordingMediaTracks(captureCanvas, captureFps);
-        const recorder = new MediaRecorder(tracks, {
+        if (tracks === null || tracks.getVideoTracks().length === 0) {
+            animation = false;
+            captureCanvas.remove();
+            return null;
+        }
+        const hasAudio = tracks.getAudioTracks().length > 0;
+        const recordingType = this.getPreferredScreenRecordingType(captureFormat, hasAudio) || this.getPreferredScreenRecordingType("detect", hasAudio);
+        if (recordingType === null) {
+            animation = false;
+            for (const track of tracks.getTracks()) {
+                track.stop();
+            }
+            captureCanvas.remove();
+            return null;
+        }
+        const recorderOptions = {
             videoBitsPerSecond: captureVideoBitrate,
-            audioBitsPerSecond: captureAudioBitrate,
-            mimeType: "video/" + captureFormat
-        });
+            mimeType: recordingType.mimeType
+        };
+        if (hasAudio) {
+            recorderOptions.audioBitsPerSecond = captureAudioBitrate;
+        }
+        let recorder = null;
+        try {
+            recorder = new MediaRecorder(tracks, recorderOptions);
+        } catch(e) {
+            if (this.debug) console.error("Unable to start screen recording", e);
+            animation = false;
+            for (const track of tracks.getTracks()) {
+                track.stop();
+            }
+            captureCanvas.remove();
+            return null;
+        }
         recorder.addEventListener("dataavailable", e => {
-            chunks.push(e.data);
+            if (e.data && e.data.size > 0) {
+                chunks.push(e.data);
+            }
         });
         recorder.addEventListener("stop", () => {
-            const blob = new Blob(chunks);
+            const blob = new Blob(chunks, { type: recorder.mimeType || recordingType.mimeType });
             const url = URL.createObjectURL(blob);
             const date = new Date();
             const a = document.createElement("a");
             a.href = url;
-            a.download = this.getBaseFileName() + "-" + date.getMonth() + "-" + date.getDate() + "-" + date.getFullYear() + "." + captureFormat;
+            a.download = this.getBaseFileName() + "-" + date.getMonth() + "-" + date.getDate() + "-" + date.getFullYear() + "." + recordingType.extension;
             a.click();
 
             animation = false;
