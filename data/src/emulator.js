@@ -6320,9 +6320,131 @@ class EmulatorJS {
         return formats;
     }
 
-    collectScreenRecordingMediaTracks(canvasEl, fps) {
+    createScreenRecordingAudioCapture() {
+        const emptyCapture = { audioTrack: null, cleanup: () => {} };
+        if (!this.Module.AL || !this.Module.AL.currentCtx || !this.Module.AL.currentCtx.audioCtx) {
+            return emptyCapture;
+        }
+
+        const alContext = this.Module.AL.currentCtx;
+        const audioContext = alContext.audioCtx;
+        if (typeof audioContext.createMediaStreamDestination !== "function") {
+            return emptyCapture;
+        }
+
+        const destination = audioContext.createMediaStreamDestination();
+        const mixNode = audioContext.createGain();
+        const connectedNodes = new Set();
+        let keepAliveSource = null;
+        let keepAliveGain = null;
+        let sourceScanInterval = null;
+
+        const connectSources = () => {
+            if (!alContext.sources) return;
+            for (const sourceIdx in alContext.sources) {
+                const source = alContext.sources[sourceIdx];
+                const gainNode = source && source.gain;
+                if (!gainNode || connectedNodes.has(gainNode)) continue;
+                try {
+                    gainNode.connect(mixNode);
+                    connectedNodes.add(gainNode);
+                } catch(e) {
+                    if (this.debug) console.warn("Unable to connect audio source for screen recording", e);
+                }
+            }
+        };
+
+        const cleanupAudioGraph = () => {
+            if (sourceScanInterval !== null) {
+                clearInterval(sourceScanInterval);
+                sourceScanInterval = null;
+            }
+            if (keepAliveSource !== null) {
+                try {
+                    keepAliveSource.stop();
+                } catch(e) {}
+                try {
+                    keepAliveSource.disconnect(keepAliveGain);
+                } catch(e) {}
+                keepAliveSource = null;
+            }
+            if (keepAliveGain !== null) {
+                try {
+                    keepAliveGain.disconnect(mixNode);
+                } catch(e) {}
+                keepAliveGain = null;
+            }
+            for (const node of connectedNodes) {
+                try {
+                    node.disconnect(mixNode);
+                } catch(e) {}
+            }
+            connectedNodes.clear();
+            try {
+                mixNode.disconnect(destination);
+            } catch(e) {}
+        };
+
+        try {
+            keepAliveGain = audioContext.createGain();
+            keepAliveGain.gain.value = 0.000001;
+            if (typeof audioContext.createConstantSource === "function") {
+                keepAliveSource = audioContext.createConstantSource();
+                keepAliveSource.offset.value = 1;
+            } else {
+                keepAliveSource = audioContext.createOscillator();
+                keepAliveSource.frequency.value = 20;
+            }
+            keepAliveSource.connect(keepAliveGain);
+            keepAliveGain.connect(mixNode);
+            keepAliveSource.start();
+            mixNode.connect(destination);
+            connectSources();
+            sourceScanInterval = setInterval(connectSources, 500);
+            if (audioContext.state === "suspended" && audioContext.resume instanceof Function) {
+                const resumePromise = audioContext.resume();
+                if (resumePromise && resumePromise.catch instanceof Function) {
+                    resumePromise.catch(() => {});
+                }
+            }
+        } catch(e) {
+            cleanupAudioGraph();
+            if (this.debug) console.warn("Unable to capture audio for screen recording", e);
+            return emptyCapture;
+        }
+
+        const audioTracks = destination.stream.getAudioTracks();
+
+        if (audioTracks.length === 0) {
+            cleanupAudioGraph();
+            return emptyCapture;
+        }
+
+        return { audioTrack: audioTracks[0], cleanup: cleanupAudioGraph };
+    }
+
+    collectScreenRecordingMediaTracks(canvasEl, fps, manualVideoFrames) {
         let videoTrack = null;
-        const videoTracks = canvasEl.captureStream(fps).getVideoTracks();
+        let canvasStream = null;
+        let usesManualVideoFrames = false;
+        try {
+            canvasStream = canvasEl.captureStream(manualVideoFrames ? 0 : fps);
+        } catch(e) {
+            if (manualVideoFrames) {
+                try {
+                    canvasStream = canvasEl.captureStream(fps);
+                    manualVideoFrames = false;
+                } catch(e) {
+                    if (this.debug) console.error("Unable to capture video stream", e);
+                    return null;
+                }
+            } else {
+                if (this.debug) console.error("Unable to capture video stream", e);
+                return null;
+            }
+        }
+
+        let videoTracks = canvasStream.getVideoTracks();
         if (videoTracks.length !== 0) {
             videoTrack = videoTracks[0];
         } else {
@@ -6330,25 +6452,21 @@ class EmulatorJS {
             return null;
         }
 
-        let audioTrack = null;
-        if (this.Module.AL && this.Module.AL.currentCtx && this.Module.AL.currentCtx.audioCtx) {
-            const alContext = this.Module.AL.currentCtx;
-            const audioContext = alContext.audioCtx;
-
-            const gainNodes = [];
-            for (let sourceIdx in alContext.sources) {
-                gainNodes.push(alContext.sources[sourceIdx].gain);
-            }
-
-            const merger = audioContext.createChannelMerger(gainNodes.length);
-            gainNodes.forEach(node => node.connect(merger));
-
-            const destination = audioContext.createMediaStreamDestination();
-            merger.connect(destination);
-
-            const audioTracks = destination.stream.getAudioTracks();
-            if (audioTracks.length !== 0) {
-                audioTrack = audioTracks[0];
+        if (manualVideoFrames) {
+            if (typeof videoTrack.requestFrame === "function") {
+                usesManualVideoFrames = true;
+            } else {
+                for (const track of canvasStream.getTracks()) {
+                    track.stop();
+                }
+                canvasStream = canvasEl.captureStream(fps);
+                videoTracks = canvasStream.getVideoTracks();
+                if (videoTracks.length !== 0) {
+                    videoTrack = videoTracks[0];
+                } else {
+                    if (this.debug) console.error("Unable to capture video stream");
+                    return null;
+                }
             }
         }
 
@@ -6356,18 +6474,81 @@ class EmulatorJS {
         if (videoTrack && videoTrack.readyState === "live") {
             stream.addTrack(videoTrack);
         }
+        const audioCapture = this.createScreenRecordingAudioCapture();
+        const audioTrack = audioCapture.audioTrack;
         if (audioTrack && audioTrack.readyState === "live") {
             stream.addTrack(audioTrack);
         }
-        return stream;
+        return {
+            stream,
+            videoTrack,
+            manualVideoFrames: usesManualVideoFrames,
+            cleanup: audioCapture.cleanup
+        };
+    }
+
+    startScreenRecordingFramePump(drawFrame, videoTrack, fps) {
+        const frameDelay = 1000 / Math.max(1, parseInt(fps) || 30);
+        const frameTolerance = Math.min(1, frameDelay * 0.1);
+        const useTimer = videoTrack && typeof videoTrack.requestFrame === "function";
+        let active = true;
+        let animationFrame = null;
+        let timeout = null;
+        let nextFrameTime = performance.now() + frameDelay;
+
+        const captureFrame = () => {
+            drawFrame();
+            if (useTimer) {
+                try {
+                    videoTrack.requestFrame();
+                } catch(e) {
+                    if (this.debug) console.warn("Unable to request screen recording frame", e);
+                }
+            }
+        };
+
+        const scheduleNextFrame = () => {
+            if (!active) return;
+            if (useTimer) {
+                timeout = setTimeout(() => tick(performance.now()), Math.max(0, nextFrameTime - performance.now() - frameTolerance));
+            } else {
+                animationFrame = requestAnimationFrame(tick);
+            }
+        };
+
+        const tick = (timestamp) => {
+            if (!active) return;
+            if (timestamp + frameTolerance >= nextFrameTime) {
+                captureFrame();
+                nextFrameTime += frameDelay;
+                if (timestamp > nextFrameTime + frameDelay) {
+                    nextFrameTime = timestamp + frameDelay;
+                }
+            }
+            scheduleNextFrame();
+        };
+
+        captureFrame();
+        nextFrameTime = performance.now() + frameDelay;
+        scheduleNextFrame();
+
+        return () => {
+            active = false;
+            if (timeout !== null) {
+                clearTimeout(timeout);
+            }
+            if (animationFrame !== null) {
+                cancelAnimationFrame(animationFrame);
+            }
+        };
     }
 
     screenRecord() {
-        const captureFps = this.getSettingValue("screenRecordingFPS") || this.capture.video.fps;
+        const captureFps = parseInt(this.getSettingValue("screenRecordingFPS") || this.capture.video.fps) || 30;
         const captureFormat = this.getSettingValue("screenRecordFormat") || this.capture.video.format;
-        const captureUpscale = this.getSettingValue("screenRecordUpscale") || this.capture.video.upscale;
-        const captureVideoBitrate = this.getSettingValue("screenRecordVideoBitrate") || this.capture.video.videoBitrate;
-        const captureAudioBitrate = this.getSettingValue("screenRecordAudioBitrate") || this.capture.video.audioBitrate;
+        const captureUpscale = parseFloat(this.getSettingValue("screenRecordUpscale") || this.capture.video.upscale) || 1;
+        const captureVideoBitrate = parseInt(this.getSettingValue("screenRecordVideoBitrate") || this.capture.video.videoBitrate) || this.capture.video.videoBitrate;
+        const captureAudioBitrate = parseInt(this.getSettingValue("screenRecordAudioBitrate") || this.capture.video.audioBitrate) || this.capture.video.audioBitrate;
         const aspectRatio = this.gameManager.getVideoDimensions("aspect") || 1.333333;
         const videoRotation = parseInt(this.getSettingValue("videoRotation") || 0);
         const videoTurned = (videoRotation === 1 || videoRotation === 3);
@@ -6385,7 +6566,9 @@ class EmulatorJS {
         const updateSize = () => {
             width = this.canvas.width;
             height = this.canvas.height;
-            frameAspect = width / height
+            frameAspect = width / height;
+            offsetX = 0;
+            offsetY = 0;
             if (width >= height && !videoTurned) {
                 width = height * aspectRatio;
             } else if (width < height && !videoTurned) {
@@ -6396,9 +6579,11 @@ class EmulatorJS {
                 width = height / (1/aspectRatio);
             }
             canvasAspect = width / height;
-            captureCanvas.width = width * captureUpscale;
-            captureCanvas.height = height * captureUpscale;
-            captureCtx.scale(captureUpscale, captureUpscale);
+            captureCanvas.width = Math.max(1, Math.round(width * captureUpscale));
+            captureCanvas.height = Math.max(1, Math.round(height * captureUpscale));
+            captureCtx.setTransform(captureUpscale, 0, 0, captureUpscale, 0, 0);
+            captureCtx.fillStyle = "#000";
+            captureCtx.imageSmoothingEnabled = false;
             if (frameAspect > canvasAspect) {
                 offsetX = (this.canvas.width - width) / -2;
             } else if (frameAspect < canvasAspect) {
@@ -6406,37 +6591,53 @@ class EmulatorJS {
             }
         }
         updateSize();
-        this.addEventListener(this.canvas, "resize", () => {
+        const resizeListeners = this.addEventListener(this.canvas, "resize", () => {
             updateSize();
         });
 
-        let animation = true;
-
         const drawNextFrame = () => {
+            captureCtx.fillRect(0, 0, width, height);
             captureCtx.drawImage(this.canvas, offsetX, offsetY, this.canvas.width, this.canvas.height);
-            if (animation) {
-                requestAnimationFrame(drawNextFrame);
-            }
         };
-        requestAnimationFrame(drawNextFrame);
+        drawNextFrame();
 
         const chunks = [];
-        const tracks = this.collectScreenRecordingMediaTracks(captureCanvas, captureFps);
-        if (tracks === null || tracks.getVideoTracks().length === 0) {
-            animation = false;
+        const capture = this.collectScreenRecordingMediaTracks(captureCanvas, captureFps, true);
+        if (capture === null || capture.stream.getVideoTracks().length === 0) {
+            this.removeEventListener(resizeListeners);
             captureCanvas.remove();
             return null;
         }
-        const hasAudio = tracks.getAudioTracks().length > 0;
+
+        const hasAudio = capture.stream.getAudioTracks().length > 0;
         const recordingType = this.getPreferredScreenRecordingType(captureFormat, hasAudio) || this.getPreferredScreenRecordingType("detect", hasAudio);
         if (recordingType === null) {
-            animation = false;
-            for (const track of tracks.getTracks()) {
+            this.removeEventListener(resizeListeners);
+            capture.cleanup();
+            for (const track of capture.stream.getTracks()) {
                 track.stop();
             }
             captureCanvas.remove();
             return null;
         }
+
+        let stopFramePump = null;
+        let cleanedUp = false;
+        const cleanup = () => {
+            if (cleanedUp) return;
+            cleanedUp = true;
+            if (stopFramePump !== null) {
+                stopFramePump();
+            }
+            this.removeEventListener(resizeListeners);
+            capture.cleanup();
+            for (const track of capture.stream.getTracks()) {
+                track.stop();
+            }
+            captureCanvas.remove();
+        };
+
+        let recorder = null;
         const recorderOptions = {
             videoBitsPerSecond: captureVideoBitrate,
             mimeType: recordingType.mimeType
@@ -6444,24 +6645,23 @@ class EmulatorJS {
         if (hasAudio) {
             recorderOptions.audioBitsPerSecond = captureAudioBitrate;
         }
-        let recorder = null;
+
         try {
-            recorder = new MediaRecorder(tracks, recorderOptions);
+            recorder = new MediaRecorder(capture.stream, recorderOptions);
         } catch(e) {
             if (this.debug) console.error("Unable to start screen recording", e);
-            animation = false;
-            for (const track of tracks.getTracks()) {
-                track.stop();
-            }
-            captureCanvas.remove();
+            cleanup();
             return null;
         }
+
         recorder.addEventListener("dataavailable", e => {
             if (e.data && e.data.size > 0) {
                 chunks.push(e.data);
             }
         });
         recorder.addEventListener("stop", () => {
+            cleanup();
+            if (chunks.length === 0) return;
             const blob = new Blob(chunks, { type: recorder.mimeType || recordingType.mimeType });
             const url = URL.createObjectURL(blob);
             const date = new Date();
@@ -6469,11 +6669,25 @@ class EmulatorJS {
             a.href = url;
             a.download = this.getBaseFileName() + "-" + date.getMonth() + "-" + date.getDate() + "-" + date.getFullYear() + "." + recordingType.extension;
             a.click();
-
-            animation = false;
-            captureCanvas.remove();
+            setTimeout(() => {
+                URL.revokeObjectURL(url);
+            }, 1000);
         });
-        recorder.start();
+
+        recorder.addEventListener("error", (e) => {
+            if (this.debug) console.error("Screen recording failed", e);
+            cleanup();
+        });
+
+        try {
+            recorder.start(1000);
+        } catch(e) {
+            if (this.debug) console.error("Unable to start screen recording", e);
+            cleanup();
+            return null;
+        }
+
+        stopFramePump = this.startScreenRecordingFramePump(drawNextFrame, capture.manualVideoFrames ? capture.videoTrack : null, captureFps);
 
         return recorder;
     }
