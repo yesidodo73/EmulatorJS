@@ -6490,29 +6490,19 @@ class EmulatorJS {
     startScreenRecordingFramePump(drawFrame, videoTrack, fps) {
         const frameDelay = 1000 / Math.max(1, parseInt(fps) || 30);
         const frameTolerance = Math.min(1, frameDelay * 0.1);
-        const useTimer = videoTrack && typeof videoTrack.requestFrame === "function";
+        const usesManualVideoFrames = videoTrack && typeof videoTrack.requestFrame === "function";
         let active = true;
         let animationFrame = null;
-        let timeout = null;
         let nextFrameTime = performance.now() + frameDelay;
 
         const captureFrame = () => {
             drawFrame();
-            if (useTimer) {
+            if (usesManualVideoFrames) {
                 try {
                     videoTrack.requestFrame();
                 } catch(e) {
                     if (this.debug) console.warn("Unable to request screen recording frame", e);
                 }
-            }
-        };
-
-        const scheduleNextFrame = () => {
-            if (!active) return;
-            if (useTimer) {
-                timeout = setTimeout(() => tick(performance.now()), Math.max(0, nextFrameTime - performance.now() - frameTolerance));
-            } else {
-                animationFrame = requestAnimationFrame(tick);
             }
         };
 
@@ -6525,18 +6515,15 @@ class EmulatorJS {
                     nextFrameTime = timestamp + frameDelay;
                 }
             }
-            scheduleNextFrame();
+            animationFrame = requestAnimationFrame(tick);
         };
 
         captureFrame();
         nextFrameTime = performance.now() + frameDelay;
-        scheduleNextFrame();
+        animationFrame = requestAnimationFrame(tick);
 
         return () => {
             active = false;
-            if (timeout !== null) {
-                clearTimeout(timeout);
-            }
             if (animationFrame !== null) {
                 cancelAnimationFrame(animationFrame);
             }
