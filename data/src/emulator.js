@@ -6491,11 +6491,15 @@ class EmulatorJS {
         const frameDelay = 1000 / Math.max(1, parseInt(fps) || 30);
         const frameTolerance = Math.min(1, frameDelay * 0.1);
         const usesManualVideoFrames = videoTrack && typeof videoTrack.requestFrame === "function";
+        const Module = (this.gameManager && this.gameManager.Module) ? this.gameManager.Module : this.Module;
+        const originalPostMainLoop = Module ? Module.postMainLoop : null;
         let active = true;
         let animationFrame = null;
-        let nextFrameTime = performance.now() + frameDelay;
+        let postMainLoop = null;
+        let nextFrameTime = 0;
 
-        const captureFrame = () => {
+        const captureFrame = (timestamp) => {
+            if (!active || (nextFrameTime !== 0 && timestamp + frameTolerance < nextFrameTime)) return;
             drawFrame();
             if (usesManualVideoFrames) {
                 try {
@@ -6504,28 +6508,53 @@ class EmulatorJS {
                     if (this.debug) console.warn("Unable to request screen recording frame", e);
                 }
             }
-        };
-
-        const tick = (timestamp) => {
-            if (!active) return;
-            if (timestamp + frameTolerance >= nextFrameTime) {
-                captureFrame();
+            if (nextFrameTime === 0) {
+                nextFrameTime = timestamp + frameDelay;
+            } else {
                 nextFrameTime += frameDelay;
                 if (timestamp > nextFrameTime + frameDelay) {
                     nextFrameTime = timestamp + frameDelay;
                 }
             }
-            animationFrame = requestAnimationFrame(tick);
         };
 
-        captureFrame();
-        nextFrameTime = performance.now() + frameDelay;
-        animationFrame = requestAnimationFrame(tick);
+        if (Module) {
+            const runOriginalPostMainLoop = () => {
+                if (typeof originalPostMainLoop !== "function") return;
+                try {
+                    originalPostMainLoop.call(Module);
+                } catch(e) {
+                    if (this.debug) console.warn("Screen recording post-frame callback failed", e);
+                }
+            };
+            postMainLoop = () => {
+                if (!active) {
+                    if (Module.postMainLoop === postMainLoop) {
+                        Module.postMainLoop = originalPostMainLoop;
+                    }
+                    runOriginalPostMainLoop();
+                    return;
+                }
+                runOriginalPostMainLoop();
+                captureFrame(performance.now());
+            };
+            Module.postMainLoop = postMainLoop;
+        } else {
+            const tick = (timestamp) => {
+                if (!active) return;
+                captureFrame(timestamp);
+                animationFrame = requestAnimationFrame(tick);
+            };
+            animationFrame = requestAnimationFrame(tick);
+        }
 
         return () => {
             active = false;
             if (animationFrame !== null) {
                 cancelAnimationFrame(animationFrame);
+            }
+            if (Module && Module.postMainLoop === postMainLoop) {
+                Module.postMainLoop = originalPostMainLoop;
             }
         };
     }
