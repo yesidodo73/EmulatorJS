@@ -6694,7 +6694,7 @@ class EmulatorJS {
         });
 
         try {
-            recorder.start(1000);
+            recorder.start();
         } catch(e) {
             if (this.debug) console.error("Unable to start screen recording", e);
             cleanup();
