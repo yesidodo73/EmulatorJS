@@ -1117,6 +1117,7 @@ class EmulatorJS {
             arguments: [],
             preRun: [],
             postRun: [],
+            postMainLoop: this.createScreenRecordingFrameHook(),
             canvas: this.canvas,
             callbacks: {},
             parent: this.elements.parent,
@@ -6487,15 +6488,30 @@ class EmulatorJS {
         };
     }
 
+    createScreenRecordingFrameHook() {
+        const listeners = new Set();
+        const postMainLoop = () => {
+            const timestamp = performance.now();
+            for (const listener of listeners) {
+                try {
+                    listener(timestamp);
+                } catch(e) {
+                    if (this.debug) console.warn("Screen recording frame callback failed", e);
+                }
+            }
+        };
+        this.screenRecordingFrameHook = { listeners, postMainLoop };
+        return postMainLoop;
+    }
+
     startScreenRecordingFramePump(drawFrame, videoTrack, fps) {
         const frameDelay = 1000 / Math.max(1, parseInt(fps) || 30);
         const frameTolerance = Math.min(1, frameDelay * 0.1);
         const usesManualVideoFrames = videoTrack && typeof videoTrack.requestFrame === "function";
-        const Module = (this.gameManager && this.gameManager.Module) ? this.gameManager.Module : this.Module;
-        const originalPostMainLoop = Module ? Module.postMainLoop : null;
+        const frameHook = this.screenRecordingFrameHook;
         let active = true;
         let animationFrame = null;
-        let postMainLoop = null;
+        let frameListener = null;
         let nextFrameTime = 0;
 
         const captureFrame = (timestamp) => {
@@ -6518,27 +6534,9 @@ class EmulatorJS {
             }
         };
 
-        if (Module) {
-            const runOriginalPostMainLoop = () => {
-                if (typeof originalPostMainLoop !== "function") return;
-                try {
-                    originalPostMainLoop.call(Module);
-                } catch(e) {
-                    if (this.debug) console.warn("Screen recording post-frame callback failed", e);
-                }
-            };
-            postMainLoop = () => {
-                if (!active) {
-                    if (Module.postMainLoop === postMainLoop) {
-                        Module.postMainLoop = originalPostMainLoop;
-                    }
-                    runOriginalPostMainLoop();
-                    return;
-                }
-                runOriginalPostMainLoop();
-                captureFrame(performance.now());
-            };
-            Module.postMainLoop = postMainLoop;
+        if (frameHook) {
+            frameListener = (timestamp) => captureFrame(timestamp);
+            frameHook.listeners.add(frameListener);
         } else {
             const tick = (timestamp) => {
                 if (!active) return;
@@ -6553,8 +6551,8 @@ class EmulatorJS {
             if (animationFrame !== null) {
                 cancelAnimationFrame(animationFrame);
             }
-            if (Module && Module.postMainLoop === postMainLoop) {
-                Module.postMainLoop = originalPostMainLoop;
+            if (frameHook && frameListener) {
+                frameHook.listeners.delete(frameListener);
             }
         };
     }
